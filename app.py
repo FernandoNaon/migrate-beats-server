@@ -1,9 +1,14 @@
+import base64
+import json
+import os
+from pathlib import Path
+import uuid
+
 from flask import Flask, request, redirect, session, jsonify
 from flask_cors import CORS
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 from dotenv import load_dotenv
-import os
 import tidalapi
 
 load_dotenv()
@@ -41,8 +46,104 @@ TIDAL_CLIENT_SECRET = os.environ.get("TIDAL_CLIENT_SECRET")
 
 FRONTEND_REDIRECT = os.environ.get("FRONTEND_REDIRECT", "http://localhost:5173/callback")
 
-# Store Tidal sessions in memory
+# Store pending Tidal sessions in memory and completed sessions on disk.
 tidal_sessions = {}
+TIDAL_SESSION_DIR = Path(app.config.get("TIDAL_SESSION_DIR", ".tidal-sessions"))
+TIDAL_SESSION_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def serialize_tidal_user(user):
+    return {
+        "id": str(user.id) if user else "unknown",
+        "name": getattr(user, "name", None) or getattr(user, "first_name", None) or (str(user.id) if user else "Tidal User"),
+    }
+
+
+def get_tidal_session_path(session_id):
+    return TIDAL_SESSION_DIR / f"{session_id}.json"
+
+
+def save_tidal_session(session_id, tidal_session):
+    tidal_session.save_session_to_file(get_tidal_session_path(session_id))
+
+
+def remove_tidal_session(session_id):
+    tidal_sessions.pop(session_id, None)
+    session_path = get_tidal_session_path(session_id)
+    if session_path.exists():
+        session_path.unlink()
+
+
+def load_persisted_tidal_session(session_id):
+    session_path = get_tidal_session_path(session_id)
+    if not session_path.exists():
+        return None
+
+    tidal_session = tidalapi.Session()
+    if not tidal_session.load_session_from_file(session_path):
+        session_path.unlink(missing_ok=True)
+        return None
+
+    if not tidal_session.check_login():
+        session_path.unlink(missing_ok=True)
+        return None
+
+    return tidal_session
+
+
+def get_tidal_session_data(session_id):
+    if not session_id:
+        return None
+
+    tidal_data = tidal_sessions.get(session_id)
+    if tidal_data and tidal_data.get("future") is not None:
+        return tidal_data
+
+    if tidal_data and tidal_data.get("session") is not None:
+        try:
+            if tidal_data["session"].check_login():
+                return tidal_data
+        except Exception:
+            tidal_sessions.pop(session_id, None)
+
+    persisted_session = load_persisted_tidal_session(session_id)
+    if not persisted_session:
+        return None
+
+    tidal_data = {
+        "session": persisted_session,
+        "user": serialize_tidal_user(persisted_session.user),
+    }
+    tidal_sessions[session_id] = tidal_data
+    return tidal_data
+
+
+def encode_client_state(client_redirect_uri):
+    if not client_redirect_uri:
+        return None
+
+    payload = json.dumps({"client_redirect_uri": client_redirect_uri}).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("utf-8").rstrip("=")
+
+
+def decode_client_state(state_value):
+    if not state_value:
+        return None
+
+    padding = "=" * (-len(state_value) % 4)
+    payload = base64.urlsafe_b64decode(f"{state_value}{padding}")
+    return json.loads(payload.decode("utf-8"))
+
+
+def is_allowed_client_redirect(client_redirect_uri):
+    allowed_prefixes = [
+        FRONTEND_URL,
+        FRONTEND_REDIRECT,
+        "http://localhost",
+        "http://127.0.0.1",
+        "playlistmover://",
+    ]
+    return any(client_redirect_uri.startswith(prefix) for prefix in allowed_prefixes)
 
 
 # ==================== DATABASE ENDPOINTS ====================
@@ -119,6 +220,12 @@ def user_me():
             "avatar_url": user.avatar_url,
             "tier": user.tier,
             "created_at": user.created_at.isoformat() if user.created_at else None,
+            "last_login_at": user.last_login_at.isoformat() if user.last_login_at else None,
+            "is_active": user.is_active,
+            "usage": {
+                "migrations_today": migrations_today,
+                "migrations_limit": rate_limit,
+            },
             "migrations_today": migrations_today,
             "migrations_remaining": max(0, rate_limit - migrations_today),
             "rate_limit": rate_limit
@@ -145,7 +252,7 @@ def user_history():
         # Find user by Spotify identity
         identity = UserIdentity.query.filter_by(
             provider="spotify",
-            provider_id=spotify_user["id"]
+            provider_user_id=spotify_user["id"]
         ).first()
 
         if not identity:
@@ -200,14 +307,35 @@ def get_spotify_client(code):
 
 @app.route("/login", methods=["GET"])
 def login():
-    auth_url = get_spotify_oauth().get_authorize_url()
+    client_redirect_uri = request.args.get("client_redirect_uri")
+    state = None
+
+    if client_redirect_uri:
+        if not is_allowed_client_redirect(client_redirect_uri):
+            return jsonify({"error": "Unsupported client redirect URI"}), 400
+        state = encode_client_state(client_redirect_uri)
+
+    auth_url = get_spotify_oauth().get_authorize_url(state=state)
     return jsonify({"auth_url": auth_url})
 
 
 @app.route("/callback")
 def spotify_callback_redirect():
     code = request.args.get("code")
-    return redirect(f"{FRONTEND_REDIRECT}?code={code}")
+    state = request.args.get("state")
+    redirect_target = FRONTEND_REDIRECT
+
+    if state:
+        try:
+            client_state = decode_client_state(state)
+            client_redirect_uri = client_state.get("client_redirect_uri")
+            if client_redirect_uri and is_allowed_client_redirect(client_redirect_uri):
+                redirect_target = client_redirect_uri
+        except Exception as e:
+            print(f"[SPOTIFY] Invalid callback state: {e}")
+
+    separator = "&" if "?" in redirect_target else "?"
+    return redirect(f"{redirect_target}{separator}code={code}")
 
 
 # ==================== SPOTIFY PLAYLISTS ====================
@@ -516,8 +644,6 @@ def tidal_login():
         # Use login_oauth - this uses tidalapi's internal credentials
         login, future = tidal_session.login_oauth()
 
-        # Generate a unique session ID
-        import uuid
         session_id = str(uuid.uuid4())
 
         tidal_sessions[session_id] = {
@@ -552,14 +678,28 @@ def tidal_check_auth():
     data = request.get_json()
     session_id = data.get("session_id")
 
-    if not session_id or session_id not in tidal_sessions:
-        print(f"[Tidal] Invalid session: {session_id}")
+    if not session_id:
         return jsonify({"authenticated": False, "error": "Invalid session"}), 200
 
     try:
-        tidal_data = tidal_sessions[session_id]
+        tidal_data = get_tidal_session_data(session_id)
+        if not tidal_data:
+            print(f"[Tidal] Invalid session: {session_id}")
+            return jsonify({"authenticated": False, "error": "Invalid session"}), 200
+
         tidal_session = tidal_data["session"]
-        future = tidal_data["future"]
+        future = tidal_data.get("future")
+
+        if future is None:
+            if tidal_session.check_login():
+                user = tidal_session.user
+                return jsonify({
+                    "authenticated": True,
+                    "user": serialize_tidal_user(user)
+                })
+
+            remove_tidal_session(session_id)
+            return jsonify({"authenticated": False, "error": "Session expired"}), 200
 
         print(f"[Tidal] Checking auth - future.done(): {future.done()}")
 
@@ -569,16 +709,21 @@ def tidal_check_auth():
                 future.result()  # This will raise if there was an error
                 # Authorization successful
                 user = tidal_session.user
+                save_tidal_session(session_id, tidal_session)
+                tidal_sessions[session_id] = {
+                    "session": tidal_session,
+                    "future": None,
+                    "login": None,
+                    "user": serialize_tidal_user(user),
+                }
                 print(f"[Tidal] Auth successful! User: {user}")
                 return jsonify({
                     "authenticated": True,
-                    "user": {
-                        "id": str(user.id) if user else "unknown",
-                        "name": getattr(user, 'name', None) or getattr(user, 'first_name', None) or str(user.id) if user else "Tidal User"
-                    }
+                    "user": serialize_tidal_user(user)
                 })
             except Exception as e:
                 print(f"[Tidal] Future result error: {e}")
+                remove_tidal_session(session_id)
                 return jsonify({"authenticated": False, "error": str(e)})
         else:
             print(f"[Tidal] Still waiting for user to authorize...")
@@ -595,11 +740,12 @@ def tidal_playlists():
     data = request.get_json()
     session_id = data.get("session_id")
 
-    if not session_id or session_id not in tidal_sessions:
+    tidal_data = get_tidal_session_data(session_id)
+    if not tidal_data:
         return jsonify({"error": "Invalid session"}), 400
 
     try:
-        tidal_session = tidal_sessions[session_id]["session"]
+        tidal_session = tidal_data["session"]
         user_playlists = tidal_session.user.playlists()
 
         playlists = []
@@ -638,13 +784,14 @@ def tidal_playlist_tracks():
     session_id = data.get("session_id")
     playlist_id = data.get("playlist_id")
 
-    if not session_id or session_id not in tidal_sessions:
+    tidal_data = get_tidal_session_data(session_id)
+    if not tidal_data:
         return jsonify({"error": "Invalid session"}), 400
     if not playlist_id:
         return jsonify({"error": "Playlist ID required"}), 400
 
     try:
-        tidal_session = tidal_sessions[session_id]["session"]
+        tidal_session = tidal_data["session"]
         playlist = tidal_session.playlist(playlist_id)
         playlist_tracks = playlist.tracks()
 
@@ -684,13 +831,14 @@ def tidal_delete_playlist():
     session_id = data.get("session_id")
     playlist_id = data.get("playlist_id")
 
-    if not session_id or session_id not in tidal_sessions:
+    tidal_data = get_tidal_session_data(session_id)
+    if not tidal_data:
         return jsonify({"error": "Invalid session"}), 400
     if not playlist_id:
         return jsonify({"error": "Playlist ID required"}), 400
 
     try:
-        tidal_session = tidal_sessions[session_id]["session"]
+        tidal_session = tidal_data["session"]
         playlist = tidal_session.playlist(playlist_id)
 
         # Delete the playlist
@@ -711,7 +859,8 @@ def tidal_merge_playlists():
     source_playlist_id = data.get("source_playlist_id")  # Playlist to merge FROM (will be deleted)
     target_playlist_id = data.get("target_playlist_id")  # Playlist to merge INTO (will keep)
 
-    if not session_id or session_id not in tidal_sessions:
+    tidal_data = get_tidal_session_data(session_id)
+    if not tidal_data:
         return jsonify({"error": "Invalid session"}), 400
     if not source_playlist_id or not target_playlist_id:
         return jsonify({"error": "Both source and target playlist IDs required"}), 400
@@ -719,7 +868,7 @@ def tidal_merge_playlists():
         return jsonify({"error": "Cannot merge a playlist with itself"}), 400
 
     try:
-        tidal_session = tidal_sessions[session_id]["session"]
+        tidal_session = tidal_data["session"]
 
         # Get both playlists
         source_playlist = tidal_session.playlist(source_playlist_id)
@@ -767,13 +916,14 @@ def tidal_search():
     session_id = data.get("session_id")
     query = data.get("query")
 
-    if not session_id or session_id not in tidal_sessions:
+    tidal_data = get_tidal_session_data(session_id)
+    if not tidal_data:
         return jsonify({"error": "Invalid session"}), 400
     if not query:
         return jsonify({"error": "Query required"}), 400
 
     try:
-        tidal_session = tidal_sessions[session_id]["session"]
+        tidal_session = tidal_data["session"]
         results = tidal_session.search(query, models=[tidalapi.media.Track], limit=5)
 
         tracks = []
@@ -799,13 +949,14 @@ def tidal_create_playlist():
     description = data.get("description", "")
     track_ids = data.get("track_ids", [])
 
-    if not session_id or session_id not in tidal_sessions:
+    tidal_data = get_tidal_session_data(session_id)
+    if not tidal_data:
         return jsonify({"error": "Invalid session"}), 400
     if not name:
         return jsonify({"error": "Playlist name required"}), 400
 
     try:
-        tidal_session = tidal_sessions[session_id]["session"]
+        tidal_session = tidal_data["session"]
 
         # Create playlist
         playlist = tidal_session.user.create_playlist(name, description)
@@ -836,11 +987,12 @@ def tidal_liked_songs():
     limit = data.get("limit", 50)
     offset = data.get("offset", 0)
 
-    if not session_id or session_id not in tidal_sessions:
+    tidal_data = get_tidal_session_data(session_id)
+    if not tidal_data:
         return jsonify({"error": "Invalid session"}), 400
 
     try:
-        tidal_session = tidal_sessions[session_id]["session"]
+        tidal_session = tidal_data["session"]
 
         # Get user's favorite tracks
         favorites = tidal_session.user.favorites
@@ -859,8 +1011,9 @@ def tidal_liked_songs():
                 "added_at": track.user_date_added.isoformat() if hasattr(track, 'user_date_added') and track.user_date_added else None
             })
 
-        # Try to get total count
-        total = len(favorite_tracks)  # Fallback
+        # tidalapi does not expose the total count consistently, so report the
+        # minimum known total for the current window.
+        total = offset + len(favorite_tracks)
         has_more = len(favorite_tracks) == limit
 
         return jsonify({
@@ -889,7 +1042,8 @@ def migrate_tidal_to_spotify():
 
     if not spotify_code:
         return jsonify({"error": "Spotify authorization required"}), 400
-    if not tidal_session_id or tidal_session_id not in tidal_sessions:
+    tidal_data = get_tidal_session_data(tidal_session_id)
+    if not tidal_data:
         return jsonify({"error": "Tidal authorization required"}), 400
     if not playlist_id:
         return jsonify({"error": "Playlist ID required"}), 400
@@ -900,7 +1054,7 @@ def migrate_tidal_to_spotify():
     try:
         # Get clients
         sp, _ = get_spotify_client(spotify_code)
-        tidal_session = tidal_sessions[tidal_session_id]["session"]
+        tidal_session = tidal_data["session"]
 
         # Get user ID for tracking
         try:
@@ -1021,7 +1175,8 @@ def migrate_tidal_tracks():
 
     if not spotify_code:
         return jsonify({"error": "Spotify authorization required"}), 400
-    if not tidal_session_id or tidal_session_id not in tidal_sessions:
+    tidal_data = get_tidal_session_data(tidal_session_id)
+    if not tidal_data:
         return jsonify({"error": "Tidal authorization required"}), 400
     if not tracks:
         return jsonify({"error": "No tracks provided"}), 400
@@ -1160,7 +1315,8 @@ def migrate_tracks():
 
     if not spotify_code:
         return jsonify({"error": "Spotify authorization required"}), 400
-    if not tidal_session_id or tidal_session_id not in tidal_sessions:
+    tidal_data = get_tidal_session_data(tidal_session_id)
+    if not tidal_data:
         return jsonify({"error": "Tidal authorization required"}), 400
     if not tracks:
         return jsonify({"error": "No tracks provided"}), 400
@@ -1180,7 +1336,7 @@ def migrate_tracks():
         print(f"[MIGRATE] Could not identify user: {e}")
 
     try:
-        tidal_session = tidal_sessions[tidal_session_id]["session"]
+        tidal_session = tidal_data["session"]
 
         # Search for tracks on Tidal and collect IDs
         tidal_track_ids = []
@@ -1277,7 +1433,8 @@ def migrate_playlist():
 
     if not spotify_code:
         return jsonify({"error": "Spotify authorization required"}), 400
-    if not tidal_session_id or tidal_session_id not in tidal_sessions:
+    tidal_data = get_tidal_session_data(tidal_session_id)
+    if not tidal_data:
         return jsonify({"error": "Tidal authorization required"}), 400
     if not playlist_id:
         return jsonify({"error": "Playlist ID required"}), 400
@@ -1288,7 +1445,7 @@ def migrate_playlist():
     try:
         # Get Spotify tracks
         sp, _ = get_spotify_client(spotify_code)
-        tidal_session = tidal_sessions[tidal_session_id]["session"]
+        tidal_session = tidal_data["session"]
 
         # Get user ID for tracking
         try:

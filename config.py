@@ -28,6 +28,7 @@ class Config:
 
     # CORS
     FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:5173')
+    TIDAL_SESSION_DIR = os.environ.get('TIDAL_SESSION_DIR', '.tidal-sessions')
 
     # Rate Limits (per day)
     RATE_LIMIT_MIGRATIONS = int(os.environ.get('RATE_LIMIT_MIGRATIONS', 25))

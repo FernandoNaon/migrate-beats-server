@@ -3,11 +3,14 @@ Database models for Migrate Beats.
 Optimized for free-tier PostgreSQL (minimal storage, JSON caching).
 """
 from datetime import datetime
-from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy.dialects.postgresql import JSONB
 import uuid
 
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import JSON
+from sqlalchemy.dialects.postgresql import JSONB
+
 db = SQLAlchemy()
+JSON_TYPE = JSON().with_variant(JSONB, "postgresql")
 
 
 def generate_uuid():
@@ -70,7 +73,7 @@ class UserActivity(db.Model):
     id = db.Column(db.String(36), primary_key=True, default=generate_uuid)
     user_id = db.Column(db.String(36), db.ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
     action = db.Column(db.String(50), nullable=False)  # login, migration, fetch_playlists, etc.
-    details = db.Column(JSONB, default={})  # Flexible activity details
+    details = db.Column(JSON_TYPE, default=dict)  # Flexible activity details
     success = db.Column(db.Boolean, default=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
@@ -97,7 +100,7 @@ class Migration(db.Model):
     total_tracks = db.Column(db.Integer, default=0)
     migrated_tracks = db.Column(db.Integer, default=0)
     skipped_tracks = db.Column(db.Integer, default=0)
-    not_found_tracks = db.Column(JSONB, default=[])  # Store first 10 not found
+    not_found_tracks = db.Column(JSON_TYPE, default=list)  # Store first 10 not found
     status = db.Column(db.String(20), default='pending')  # pending, in_progress, completed, failed
     error_message = db.Column(db.Text)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)

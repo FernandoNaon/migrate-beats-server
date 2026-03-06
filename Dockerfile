@@ -22,5 +22,6 @@ COPY . .
 # Expose port (Railway sets PORT dynamically)
 EXPOSE 5000
 
-# Run with gunicorn - Railway provides $PORT env var
-CMD gunicorn --bind 0.0.0.0:${PORT:-5000} --workers 2 app:app
+# Run with a single worker so the device-auth polling flow and
+# in-process pending Tidal login future stay consistent.
+CMD gunicorn --bind 0.0.0.0:${PORT:-5000} --workers 1 app:app
