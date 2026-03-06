@@ -2,6 +2,7 @@ import base64
 import json
 import os
 from pathlib import Path
+from urllib.parse import urlparse
 import uuid
 
 from flask import Flask, request, redirect, session, jsonify
@@ -28,9 +29,48 @@ db.init_app(app)
 
 # CORS Configuration - support both local and production
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:5173")
+FRONTEND_REDIRECT = os.environ.get("FRONTEND_REDIRECT", "http://localhost:5173/callback")
+
+
+def origin_from_url(url):
+    if not url:
+        return None
+
+    parsed = urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        return None
+
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def build_allowed_origins():
+    configured_values = []
+    for raw_value in [FRONTEND_URL, FRONTEND_REDIRECT]:
+        if not raw_value:
+            continue
+        configured_values.extend(part.strip() for part in raw_value.split(",") if part.strip())
+
+    local_dev_origins = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://0.0.0.0:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://0.0.0.0:5173",
+    ]
+
+    allowed = []
+    for value in configured_values + local_dev_origins:
+        origin = origin_from_url(value)
+        if origin and origin not in allowed:
+            allowed.append(origin)
+
+    return allowed
+
+
 CORS(app,
      supports_credentials=True,
-     origins=[FRONTEND_URL, "http://localhost:5173", "http://127.0.0.1:5173"],
+     origins=build_allowed_origins(),
      allow_headers=["Content-Type", "Authorization"],
      methods=["GET", "POST", "OPTIONS"])
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "supersecretkey")
@@ -43,8 +83,6 @@ SPOTIPY_REDIRECT_URI = os.environ.get("SPOTIPY_REDIRECT_URI", "http://127.0.0.1:
 # Tidal Configuration
 TIDAL_CLIENT_ID = os.environ.get("TIDAL_CLIENT_ID")
 TIDAL_CLIENT_SECRET = os.environ.get("TIDAL_CLIENT_SECRET")
-
-FRONTEND_REDIRECT = os.environ.get("FRONTEND_REDIRECT", "http://localhost:5173/callback")
 
 # Store pending Tidal sessions in memory and completed sessions on disk.
 tidal_sessions = {}
