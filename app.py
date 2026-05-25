@@ -176,8 +176,8 @@ def user_history():
         return jsonify({"error": str(e)}), 500
 
 
-# Extended scopes for dashboard insights
-SCOPE = "playlist-read-private playlist-read-collaborative user-top-read user-read-recently-played user-library-read user-read-private user-follow-read"
+# Extended scopes for dashboard insights + playlist management
+SCOPE = "playlist-read-private playlist-read-collaborative playlist-modify-private playlist-modify-public user-top-read user-read-recently-played user-library-read user-read-private user-follow-read"
 
 
 def get_spotify_oauth():
@@ -274,12 +274,14 @@ def playlist_tracks():
                 if track:
                     tracks.append({
                         "id": track.get("id"),
+                        "uri": track.get("uri"),
                         "name": track["name"],
                         "artist": ", ".join([artist["name"] for artist in track["artists"]]),
                         "artists": [artist["name"] for artist in track["artists"]],
                         "album": track["album"]["name"],
                         "duration_ms": track["duration_ms"],
-                        "image": track["album"]["images"][0]["url"] if track["album"].get("images") else None
+                        "image": track["album"]["images"][0]["url"] if track["album"].get("images") else None,
+                        "is_local": bool(track.get("is_local"))
                     })
 
             if results.get("next"):
@@ -288,6 +290,273 @@ def playlist_tracks():
                 break
 
         return jsonify(tracks)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ==================== SPOTIFY PLAYLIST MANAGEMENT ====================
+
+@app.route("/playlist/details", methods=["POST"])
+def playlist_details():
+    """Get a Spotify playlist with snapshot_id + all tracks. Used by the playlist manager."""
+    data = request.get_json()
+    code = data.get("code")
+    playlist_id = data.get("playlist_id")
+
+    if not code:
+        return jsonify({"error": "Authorization code required"}), 400
+    if not playlist_id:
+        return jsonify({"error": "playlist_id is required"}), 400
+
+    try:
+        sp, _ = get_spotify_client(code)
+        meta = sp.playlist(playlist_id, fields="id,name,snapshot_id,owner.id,owner.display_name,images,tracks.total")
+
+        tracks = []
+        offset = 0
+        limit = 100
+        while True:
+            results = sp.playlist_tracks(playlist_id, offset=offset, limit=limit)
+            for item in results["items"]:
+                track = item.get("track")
+                if not track:
+                    continue
+                tracks.append({
+                    "id": track.get("id"),
+                    "uri": track.get("uri"),
+                    "name": track["name"],
+                    "artist": ", ".join([a["name"] for a in track["artists"]]),
+                    "artists": [a["name"] for a in track["artists"]],
+                    "album": track["album"]["name"],
+                    "duration_ms": track["duration_ms"],
+                    "image": track["album"]["images"][0]["url"] if track["album"].get("images") else None,
+                    "is_local": bool(track.get("is_local"))
+                })
+            if results.get("next"):
+                offset += limit
+            else:
+                break
+
+        # Owner check — only owner can mutate (collaborative is rare; treat as read-only for v1)
+        me = sp.current_user()
+        is_owner = meta.get("owner", {}).get("id") == me.get("id")
+
+        return jsonify({
+            "id": meta["id"],
+            "name": meta["name"],
+            "snapshot_id": meta["snapshot_id"],
+            "image": meta["images"][0]["url"] if meta.get("images") else None,
+            "owner": meta.get("owner", {}).get("display_name"),
+            "is_owner": is_owner,
+            "tracks_total": meta.get("tracks", {}).get("total", len(tracks)),
+            "tracks": tracks
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/playlist/create", methods=["POST"])
+def playlist_create():
+    """Create a new Spotify playlist."""
+    data = request.get_json()
+    code = data.get("code")
+    name = data.get("name")
+    description = data.get("description", "")
+    public = bool(data.get("public", False))
+
+    if not code:
+        return jsonify({"error": "Authorization code required"}), 400
+    if not name or not name.strip():
+        return jsonify({"error": "name is required"}), 400
+
+    try:
+        sp, _ = get_spotify_client(code)
+        me = sp.current_user()
+        playlist = sp.user_playlist_create(me["id"], name.strip(), public=public, description=description)
+        return jsonify({
+            "id": playlist["id"],
+            "name": playlist["name"],
+            "snapshot_id": playlist.get("snapshot_id"),
+            "image": playlist["images"][0]["url"] if playlist.get("images") else None,
+            "owner": playlist.get("owner", {}).get("display_name"),
+            "tracks_total": 0
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/playlist/add_tracks", methods=["POST"])
+def playlist_add_tracks():
+    """Add tracks to a Spotify playlist. Batches in chunks of 100."""
+    data = request.get_json()
+    code = data.get("code")
+    playlist_id = data.get("playlist_id")
+    track_uris = data.get("track_uris", [])
+    position = data.get("position")  # optional insertion index
+
+    if not code:
+        return jsonify({"error": "Authorization code required"}), 400
+    if not playlist_id:
+        return jsonify({"error": "playlist_id is required"}), 400
+    if not track_uris:
+        return jsonify({"error": "track_uris is required"}), 400
+
+    try:
+        sp, _ = get_spotify_client(code)
+        snapshot_id = None
+        for i in range(0, len(track_uris), 100):
+            batch = track_uris[i:i + 100]
+            kwargs = {}
+            if position is not None and i == 0:
+                kwargs["position"] = position
+            result = sp.playlist_add_items(playlist_id, batch, **kwargs)
+            snapshot_id = result.get("snapshot_id", snapshot_id)
+        return jsonify({"success": True, "snapshot_id": snapshot_id, "added": len(track_uris)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/playlist/remove_tracks", methods=["POST"])
+def playlist_remove_tracks():
+    """Remove tracks from a Spotify playlist. Pass snapshot_id for safe concurrent edits."""
+    data = request.get_json()
+    code = data.get("code")
+    playlist_id = data.get("playlist_id")
+    track_uris = data.get("track_uris", [])
+    snapshot_id = data.get("snapshot_id")
+
+    if not code:
+        return jsonify({"error": "Authorization code required"}), 400
+    if not playlist_id:
+        return jsonify({"error": "playlist_id is required"}), 400
+    if not track_uris:
+        return jsonify({"error": "track_uris is required"}), 400
+
+    try:
+        sp, _ = get_spotify_client(code)
+        new_snapshot = snapshot_id
+        # spotipy: playlist_remove_all_occurrences_of_items removes by URI
+        for i in range(0, len(track_uris), 100):
+            batch = track_uris[i:i + 100]
+            result = sp.playlist_remove_all_occurrences_of_items(playlist_id, batch, snapshot_id=new_snapshot)
+            new_snapshot = result.get("snapshot_id", new_snapshot)
+        return jsonify({"success": True, "snapshot_id": new_snapshot, "removed": len(track_uris)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/playlist/reorder", methods=["POST"])
+def playlist_reorder():
+    """Reorder tracks within a single Spotify playlist."""
+    data = request.get_json()
+    code = data.get("code")
+    playlist_id = data.get("playlist_id")
+    range_start = data.get("range_start")
+    insert_before = data.get("insert_before")
+    range_length = data.get("range_length", 1)
+    snapshot_id = data.get("snapshot_id")
+
+    if not code:
+        return jsonify({"error": "Authorization code required"}), 400
+    if not playlist_id:
+        return jsonify({"error": "playlist_id is required"}), 400
+    if range_start is None or insert_before is None:
+        return jsonify({"error": "range_start and insert_before are required"}), 400
+
+    try:
+        sp, _ = get_spotify_client(code)
+        result = sp.playlist_reorder_items(
+            playlist_id,
+            range_start=range_start,
+            insert_before=insert_before,
+            range_length=range_length,
+            snapshot_id=snapshot_id
+        )
+        return jsonify({"success": True, "snapshot_id": result.get("snapshot_id")})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/playlist/delete", methods=["POST"])
+def playlist_delete():
+    """Delete (unfollow) a Spotify playlist. Spotify has no true 'delete' — the owner unfollowing
+    is the canonical way to remove it from their account."""
+    data = request.get_json()
+    code = data.get("code")
+    playlist_id = data.get("playlist_id")
+
+    if not code:
+        return jsonify({"error": "Authorization code required"}), 400
+    if not playlist_id:
+        return jsonify({"error": "playlist_id is required"}), 400
+
+    try:
+        sp, _ = get_spotify_client(code)
+        # Verify ownership — Spotify lets you unfollow any playlist, but we only want to
+        # offer this as "delete" when the user actually owns it.
+        meta = sp.playlist(playlist_id, fields="owner.id")
+        me = sp.current_user()
+        if meta.get("owner", {}).get("id") != me.get("id"):
+            return jsonify({"error": "Only the owner can delete this playlist"}), 403
+        sp.current_user_unfollow_playlist(playlist_id)
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/playlist/move_tracks", methods=["POST"])
+def playlist_move_tracks():
+    """Move tracks across two Spotify playlists. NOT atomic — returns per-step result."""
+    data = request.get_json()
+    code = data.get("code")
+    source_playlist_id = data.get("source_playlist_id")
+    target_playlist_id = data.get("target_playlist_id")
+    track_uris = data.get("track_uris", [])
+    source_snapshot_id = data.get("source_snapshot_id")
+    target_position = data.get("target_position")  # optional insertion index in target
+    copy_only = bool(data.get("copy_only", False))  # if true, don't remove from source
+
+    if not code:
+        return jsonify({"error": "Authorization code required"}), 400
+    if not source_playlist_id or not target_playlist_id:
+        return jsonify({"error": "source and target playlist_id required"}), 400
+    if source_playlist_id == target_playlist_id:
+        return jsonify({"error": "source and target must differ; use /playlist/reorder"}), 400
+    if not track_uris:
+        return jsonify({"error": "track_uris is required"}), 400
+
+    try:
+        sp, _ = get_spotify_client(code)
+
+        # 1) Add to target first — if this fails, source is untouched.
+        target_snapshot = None
+        for i in range(0, len(track_uris), 100):
+            batch = track_uris[i:i + 100]
+            kwargs = {}
+            if target_position is not None and i == 0:
+                kwargs["position"] = target_position
+            result = sp.playlist_add_items(target_playlist_id, batch, **kwargs)
+            target_snapshot = result.get("snapshot_id", target_snapshot)
+
+        # 2) Remove from source (unless copy-only).
+        source_snapshot_new = source_snapshot_id
+        removed = 0
+        if not copy_only:
+            for i in range(0, len(track_uris), 100):
+                batch = track_uris[i:i + 100]
+                result = sp.playlist_remove_all_occurrences_of_items(
+                    source_playlist_id, batch, snapshot_id=source_snapshot_new
+                )
+                source_snapshot_new = result.get("snapshot_id", source_snapshot_new)
+                removed += len(batch)
+
+        return jsonify({
+            "success": True,
+            "added": len(track_uris),
+            "removed": removed,
+            "source_snapshot_id": source_snapshot_new,
+            "target_snapshot_id": target_snapshot
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -446,6 +715,61 @@ def liked_songs():
             "limit": limit,
             "offset": offset,
             "has_more": results.get("next") is not None
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/liked_songs/move_to_playlist", methods=["POST", "OPTIONS"])
+def liked_songs_move_to_playlist():
+    """Move (or copy) liked-songs tracks into a Spotify playlist.
+    By default removes the tracks from Liked Songs after adding. Pass copy_only=true to keep them.
+    """
+    if request.method == "OPTIONS":
+        return "", 200
+    data = request.get_json()
+    code = data.get("code")
+    target_playlist_id = data.get("target_playlist_id")
+    track_ids = data.get("track_ids", [])  # bare Spotify track IDs
+    copy_only = bool(data.get("copy_only", False))
+
+    if not code:
+        return jsonify({"error": "Authorization code required"}), 400
+    if not target_playlist_id:
+        return jsonify({"error": "target_playlist_id is required"}), 400
+    if not track_ids:
+        return jsonify({"error": "track_ids is required"}), 400
+
+    try:
+        sp, _ = get_spotify_client(code)
+
+        # Verify the target playlist is owned by the user — adding to a non-owned playlist
+        # only works for collaborative ones, and "delete from liked" is destructive.
+        meta = sp.playlist(target_playlist_id, fields="owner.id,snapshot_id")
+        me = sp.current_user()
+        if meta.get("owner", {}).get("id") != me.get("id"):
+            return jsonify({"error": "Target playlist is not owned by you"}), 403
+
+        # 1) Add to playlist (chunks of 100)
+        uris = [f"spotify:track:{tid}" for tid in track_ids if tid]
+        snapshot_id = meta.get("snapshot_id")
+        for i in range(0, len(uris), 100):
+            result = sp.playlist_add_items(target_playlist_id, uris[i:i + 100])
+            snapshot_id = result.get("snapshot_id", snapshot_id)
+
+        # 2) Remove from Liked Songs unless copy_only
+        removed = 0
+        if not copy_only:
+            for i in range(0, len(track_ids), 50):
+                # current_user_saved_tracks_delete accepts up to 50 IDs
+                sp.current_user_saved_tracks_delete(track_ids[i:i + 50])
+                removed += len(track_ids[i:i + 50])
+
+        return jsonify({
+            "success": True,
+            "added": len(uris),
+            "removed": removed,
+            "snapshot_id": snapshot_id
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
