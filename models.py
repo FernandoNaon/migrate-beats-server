@@ -24,11 +24,17 @@ class User(db.Model):
     email = db.Column(db.String(255), unique=True, nullable=True)
     display_name = db.Column(db.String(255))
     avatar_url = db.Column(db.Text)
-    tier = db.Column(db.String(20), default='free')  # free, premium
+    tier = db.Column(db.String(20), default='free')  # free, plus, pro
     is_active = db.Column(db.Boolean, default=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     last_login_at = db.Column(db.DateTime)
+
+    # Archaeologist feature: gzipped+base64 JSON snapshot blob.
+    # We use db.Text (not JSONB) because the payload is already compressed bytes-as-text;
+    # storing it raw as JSONB would double the storage by re-decoding/parsing on every read.
+    archaeologist_snapshot = db.Column(db.Text, nullable=True)
+    archaeologist_snapshot_built_at = db.Column(db.DateTime, nullable=True)
 
     # Relationships
     identities = db.relationship('UserIdentity', backref='user', lazy='dynamic', cascade='all, delete-orphan')
