@@ -12,6 +12,9 @@ load_dotenv()
 from config import get_config
 from models import db, User, UserIdentity, UserActivity, Migration, ApiUsage
 from models import get_or_create_user, log_activity, check_rate_limit, increment_usage
+from archaeologist.snapshot import build_snapshot, encode_blob, decode_blob
+from archaeologist import analytics as arch_analytics
+from archaeologist import discovery as arch_discovery
 
 app = Flask(__name__)
 
@@ -1711,6 +1714,231 @@ def migrate_playlist():
         return jsonify({"error": str(e)}), 500
 
 
+# ==================== ARCHAEOLOGIST ====================
+
+# Per-tier daily limits for snapshot rebuilds (heavy: 30-80 Spotify API calls each)
+ARCH_REFRESH_LIMITS = {"free": 1, "plus": 4, "pro": 1000}
+
+
+def _resolve_user_from_code(code: str):
+    """Get the (User, sp_client) from a Spotify auth code. Returns (None, None) on failure."""
+    try:
+        sp, _ = get_spotify_client(code)
+        me = sp.current_user()
+        identity = UserIdentity.query.filter_by(provider="spotify", provider_user_id=me["id"]).first()
+        if not identity:
+            # Auto-register so a missing /user/me call doesn't block the feature
+            user, _ = get_or_create_user(
+                spotify_user_id=me["id"],
+                email=me.get("email"),
+                display_name=me.get("display_name", me["id"]),
+                avatar_url=me["images"][0]["url"] if me.get("images") else None,
+            )
+            return user, sp
+        return identity.user, sp
+    except Exception as e:
+        print(f"[ARCH] _resolve_user_from_code: {e}")
+        return None, None
+
+
+def _load_snapshot_for_user(user: User) -> dict:
+    return decode_blob(user.archaeologist_snapshot) if user.archaeologist_snapshot else {}
+
+
+def _snapshot_status_dict(user: User) -> dict:
+    built_at = user.archaeologist_snapshot_built_at
+    has_snapshot = bool(user.archaeologist_snapshot)
+    return {
+        "has_snapshot": has_snapshot,
+        "built_at": built_at.isoformat() if built_at else None,
+        "tier": user.tier or "free",
+        "daily_limit": ARCH_REFRESH_LIMITS.get(user.tier or "free", ARCH_REFRESH_LIMITS["free"]),
+    }
+
+
+@app.route("/archaeologist/status", methods=["POST"])
+def archaeologist_status():
+    """Return whether the user has a snapshot, when it was built, and quota remaining."""
+    data = request.get_json() or {}
+    code = data.get("code")
+    if not code:
+        return jsonify({"error": "Authorization code required"}), 400
+    user, _ = _resolve_user_from_code(code)
+    if not user:
+        return jsonify({"error": "Could not resolve user"}), 500
+    limit = ARCH_REFRESH_LIMITS.get(user.tier or "free", ARCH_REFRESH_LIMITS["free"])
+    _allowed, remaining = check_rate_limit(user.id, "archaeologist_refresh", daily_limit=limit)
+    return jsonify({**_snapshot_status_dict(user), "refresh_remaining": remaining})
+
+
+@app.route("/archaeologist/snapshot/refresh", methods=["POST"])
+def archaeologist_refresh():
+    """Build a fresh snapshot. Heavy — gated by daily per-tier quota."""
+    data = request.get_json() or {}
+    code = data.get("code")
+    if not code:
+        return jsonify({"error": "Authorization code required"}), 400
+
+    user, sp = _resolve_user_from_code(code)
+    if not user or not sp:
+        return jsonify({"error": "Could not resolve user"}), 500
+
+    limit = ARCH_REFRESH_LIMITS.get(user.tier or "free", ARCH_REFRESH_LIMITS["free"])
+    allowed, remaining = check_rate_limit(user.id, "archaeologist_refresh", daily_limit=limit)
+    if not allowed:
+        return jsonify({
+            "error": "Daily snapshot refresh limit reached",
+            "tier": user.tier,
+            "limit": limit,
+            "refresh_remaining": 0,
+            "built_at": user.archaeologist_snapshot_built_at.isoformat() if user.archaeologist_snapshot_built_at else None,
+        }), 429
+
+    try:
+        from datetime import datetime
+        progress_log: list[str] = []
+
+        def _log(stage, detail):
+            progress_log.append(f"{stage}: {detail}")
+
+        snapshot = build_snapshot(sp, progress=_log)
+        user.archaeologist_snapshot = encode_blob(snapshot)
+        user.archaeologist_snapshot_built_at = datetime.utcnow()
+        db.session.commit()
+        increment_usage(user.id, "archaeologist_refresh", tracks_count=snapshot["totals"].get("playlist_tracks", 0))
+        return jsonify({
+            "success": True,
+            "totals": snapshot["totals"],
+            "truncated": snapshot.get("truncated", []),
+            "built_at": user.archaeologist_snapshot_built_at.isoformat(),
+            "refresh_remaining": max(0, remaining - 1),
+            "tier": user.tier,
+            "daily_limit": limit,
+        })
+    except Exception as e:
+        db.session.rollback()
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+def _ensure_snapshot(code: str):
+    """Helper for read endpoints: return (snapshot_dict, error_response_tuple)."""
+    if not code:
+        return None, (jsonify({"error": "Authorization code required"}), 400)
+    user, _ = _resolve_user_from_code(code)
+    if not user:
+        return None, (jsonify({"error": "Could not resolve user"}), 500)
+    snap = _load_snapshot_for_user(user)
+    if not snap:
+        return None, (jsonify({"error": "No snapshot yet — call /archaeologist/snapshot/refresh first"}), 404)
+    return snap, None
+
+
+@app.route("/archaeologist/overview", methods=["POST"])
+def archaeologist_overview():
+    data = request.get_json() or {}
+    snap, err = _ensure_snapshot(data.get("code"))
+    if err:
+        return err
+    return jsonify(arch_analytics.collection_overview(snap))
+
+
+@app.route("/archaeologist/playlist_overlap", methods=["POST"])
+def archaeologist_playlist_overlap():
+    data = request.get_json() or {}
+    snap, err = _ensure_snapshot(data.get("code"))
+    if err:
+        return err
+    return jsonify(arch_analytics.playlist_overlap(snap, top_n=data.get("top_n", 20)))
+
+
+@app.route("/archaeologist/artist_dominance", methods=["POST"])
+def archaeologist_artist_dominance():
+    data = request.get_json() or {}
+    snap, err = _ensure_snapshot(data.get("code"))
+    if err:
+        return err
+    return jsonify(arch_analytics.artist_dominance(snap, top_n=data.get("top_n", 50)))
+
+
+@app.route("/archaeologist/forgotten", methods=["POST"])
+def archaeologist_forgotten():
+    data = request.get_json() or {}
+    snap, err = _ensure_snapshot(data.get("code"))
+    if err:
+        return err
+    return jsonify(arch_analytics.forgotten_songs(
+        snap,
+        top_n=data.get("top_n", 50),
+        months_threshold=data.get("months_threshold", 12),
+    ))
+
+
+@app.route("/archaeologist/playlist_health", methods=["POST"])
+def archaeologist_playlist_health():
+    data = request.get_json() or {}
+    snap, err = _ensure_snapshot(data.get("code"))
+    if err:
+        return err
+    return jsonify(arch_analytics.playlist_health(snap))
+
+
+@app.route("/archaeologist/evolution", methods=["POST"])
+def archaeologist_evolution():
+    data = request.get_json() or {}
+    snap, err = _ensure_snapshot(data.get("code"))
+    if err:
+        return err
+    return jsonify(arch_analytics.listening_evolution(snap))
+
+
+# ---- Phase 2: Library-internal discovery ----
+
+@app.route("/archaeologist/genre_clusters", methods=["POST"])
+def archaeologist_genre_clusters():
+    data = request.get_json() or {}
+    snap, err = _ensure_snapshot(data.get("code"))
+    if err:
+        return err
+    return jsonify(arch_discovery.genre_clusters(
+        snap,
+        min_artists=data.get("min_artists", 3),
+        max_clusters=data.get("max_clusters", 12),
+    ))
+
+
+@app.route("/archaeologist/genre_outliers", methods=["POST"])
+def archaeologist_genre_outliers():
+    data = request.get_json() or {}
+    snap, err = _ensure_snapshot(data.get("code"))
+    if err:
+        return err
+    return jsonify(arch_discovery.genre_outliers(snap, top_n=data.get("top_n", 30)))
+
+
+@app.route("/archaeologist/hidden_gems", methods=["POST"])
+def archaeologist_hidden_gems():
+    data = request.get_json() or {}
+    snap, err = _ensure_snapshot(data.get("code"))
+    if err:
+        return err
+    return jsonify(arch_discovery.hidden_gems(snap, top_n=data.get("top_n", 50)))
+
+
+@app.route("/archaeologist/co_occurrence", methods=["POST"])
+def archaeologist_co_occurrence():
+    data = request.get_json() or {}
+    snap, err = _ensure_snapshot(data.get("code"))
+    if err:
+        return err
+    return jsonify(arch_discovery.artist_co_occurrence(
+        snap,
+        min_playlists=data.get("min_playlists", 3),
+        top_n=data.get("top_n", 20),
+    ))
+
+
 # Create database tables on startup
 with app.app_context():
     try:
@@ -1718,6 +1946,30 @@ with app.app_context():
         print("[DB] Database tables created successfully")
     except Exception as e:
         print(f"[DB] Warning: Could not create tables: {e}")
+
+    # Idempotent column adds — db.create_all() doesn't alter existing tables.
+    # Wrapped so prod (Postgres) and dev (SQLite) both survive missing-column states.
+    _column_adds = [
+        ("users", "archaeologist_snapshot", "TEXT"),
+        ("users", "archaeologist_snapshot_built_at", "TIMESTAMP"),
+    ]
+    for table, col, coltype in _column_adds:
+        try:
+            db.session.execute(db.text(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {coltype}"))
+            db.session.commit()
+        except Exception as e:
+            db.session.rollback()
+            # SQLite lacks ADD COLUMN IF NOT EXISTS; fall back to a check + plain ADD.
+            try:
+                exists = db.session.execute(
+                    db.text(f"SELECT 1 FROM pragma_table_info('{table}') WHERE name='{col}'")
+                ).fetchone()
+                if not exists:
+                    db.session.execute(db.text(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}"))
+                    db.session.commit()
+            except Exception as inner:
+                db.session.rollback()
+                print(f"[DB] Could not ensure column {table}.{col}: {e} / {inner}")
 
 
 if __name__ == "__main__":
