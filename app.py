@@ -1,20 +1,22 @@
-from flask import Flask, request, redirect, session, jsonify
+from flask import Flask, request, redirect, session, jsonify, g
 from flask_cors import CORS
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 from dotenv import load_dotenv
 import os
 import tidalapi
+from datetime import datetime
 
 load_dotenv()
 
 # Import database
 from config import get_config
-from models import db, User, UserIdentity, UserActivity, Migration, ApiUsage
+from models import db, User, UserIdentity, UserActivity, Migration, ApiUsage, Session
 from models import get_or_create_user, log_activity, check_rate_limit, increment_usage
 from archaeologist.snapshot import build_snapshot, encode_blob, decode_blob
 from archaeologist import analytics as arch_analytics
 from archaeologist import discovery as arch_discovery
+import auth as auth_module
 
 app = Flask(__name__)
 
@@ -78,15 +80,11 @@ def db_stats():
 
 @app.route("/user/me", methods=["POST"])
 def user_me():
-    """Register or get current user from Spotify auth code."""
-    data = request.get_json()
-    code = data.get("code")
-
-    if not code:
-        return jsonify({"error": "Authorization code required"}), 400
+    """Register or get current user (legacy; prefer /auth/me). Session-authed."""
+    data = request.get_json() or {}
 
     try:
-        sp, _ = get_spotify_client(code)
+        sp, _ = get_spotify_client()
         spotify_user = sp.current_user()
 
         # Get or create user in database
@@ -134,28 +132,12 @@ def user_me():
 @app.route("/user/history", methods=["POST"])
 def user_history():
     """Get user's migration history."""
-    data = request.get_json()
-    code = data.get("code")
+    data = request.get_json() or {}
     limit = data.get("limit", 20)
 
-    if not code:
-        return jsonify({"error": "Authorization code required"}), 400
-
     try:
-        sp, _ = get_spotify_client(code)
-        spotify_user = sp.current_user()
-
-        # Find user by Spotify identity
-        identity = UserIdentity.query.filter_by(
-            provider="spotify",
-            provider_id=spotify_user["id"]
-        ).first()
-
-        if not identity:
-            return jsonify([])  # No user found, return empty history
-
-        # Get migrations for this user
-        migrations = Migration.query.filter_by(user_id=identity.user_id)\
+        # Authenticated user comes from the session gate.
+        migrations = Migration.query.filter_by(user_id=g.user.id)\
             .order_by(Migration.created_at.desc())\
             .limit(limit)\
             .all()
@@ -188,15 +170,71 @@ def get_spotify_oauth():
         client_id=SPOTIPY_CLIENT_ID,
         client_secret=SPOTIPY_CLIENT_SECRET,
         redirect_uri=SPOTIPY_REDIRECT_URI,
-        scope=SCOPE
+        scope=SCOPE,
+        cache_handler=spotipy.cache_handler.MemoryCacheHandler(),
     )
 
 
-def get_spotify_client(code):
-    """Helper to get authenticated Spotify client from auth code."""
-    sp_oauth = get_spotify_oauth()
-    token_info = sp_oauth.get_access_token(code, as_dict=True)
-    return spotipy.Spotify(auth=token_info['access_token']), token_info
+_SPOTIFY_OAUTH_KWARGS = dict(
+    client_id=SPOTIPY_CLIENT_ID,
+    client_secret=SPOTIPY_CLIENT_SECRET,
+    redirect_uri=SPOTIPY_REDIRECT_URI,
+    scope=SCOPE,
+)
+
+
+def get_spotify_client(code=None):
+    """Authenticated Spotify client for the CURRENT SESSION user.
+
+    The `code` parameter is legacy and IGNORED — auth now comes from the session
+    token resolved by the before_request gate into g.user. Kept so the many existing
+    `sp, _ = get_spotify_client(code)` call sites work unchanged. Returns (client, None).
+    """
+    user = getattr(g, "user", None)
+    if user is None:
+        raise RuntimeError("No authenticated session on this request.")
+    sp = auth_module.get_spotify_client_for_user(user, **_SPOTIFY_OAUTH_KWARGS)
+    return sp, None
+
+
+# ==================== SESSION AUTH GATE ====================
+
+# Paths that require a valid session (Bearer token). Tidal-only and /auth/* and
+# /db/* and /login,/callback stay open.
+SESSION_PROTECTED_PATHS = {
+    "/user/me", "/user/history", "/user_profile",
+    "/fetch_playlists", "/playlist_tracks",
+    "/playlist/details", "/playlist/create", "/playlist/add_tracks",
+    "/playlist/remove_tracks", "/playlist/reorder", "/playlist/delete",
+    "/playlist/genres", "/playlist/move_tracks",
+    "/top_tracks", "/top_artists", "/recently_played",
+    "/liked_songs", "/liked_songs/move_to_playlist", "/library_stats",
+    "/migrate_tidal_to_spotify", "/migrate_tidal_tracks",
+    "/migrate_tracks", "/migrate_playlist",
+    "/archaeologist/status", "/archaeologist/snapshot/refresh",
+    "/archaeologist/overview", "/archaeologist/playlist_overlap",
+    "/archaeologist/artist_dominance", "/archaeologist/forgotten",
+    "/archaeologist/playlist_health", "/archaeologist/evolution",
+    "/archaeologist/genre_clusters", "/archaeologist/genre_outliers",
+    "/archaeologist/hidden_gems", "/archaeologist/co_occurrence",
+    "/auth/me",
+    # NOTE: /auth/logout is intentionally NOT protected — it reads the token itself and
+    # should succeed (idempotently) even with an expired/invalid session.
+}
+
+
+@app.before_request
+def _session_auth_gate():
+    if request.method == "OPTIONS":
+        return  # let CORS preflight through
+    if request.path not in SESSION_PROTECTED_PATHS:
+        return
+    authz = request.headers.get("Authorization", "")
+    token = authz[7:].strip() if authz.startswith("Bearer ") else None
+    user = auth_module.resolve_session(token) if token else None
+    if not user:
+        return jsonify({"error": "Not authenticated"}), 401
+    g.user = user
 
 
 # ==================== SPOTIFY AUTH ====================
@@ -213,6 +251,85 @@ def spotify_callback_redirect():
     return redirect(f"{FRONTEND_REDIRECT}?code={code}")
 
 
+@app.route("/auth/spotify/exchange", methods=["POST", "OPTIONS"])
+def auth_spotify_exchange():
+    """Exchange a Spotify OAuth code ONCE for tokens, store them, return a session token."""
+    if request.method == "OPTIONS":
+        return "", 200
+    data = request.get_json() or {}
+    code = data.get("code")
+    if not code:
+        return jsonify({"error": "Authorization code required for exchange"}), 400
+    try:
+        user, sp, _token_info = auth_module.exchange_code_and_store(code, **_SPOTIFY_OAUTH_KWARGS)
+        log_activity(user_id=user.id, action="login", details={"provider": "spotify"})
+        session_token = auth_module.create_session(user.id)
+        return jsonify({"session_token": session_token, **_auth_me_payload(user, sp)})
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/auth/logout", methods=["POST", "OPTIONS"])
+def auth_logout():
+    if request.method == "OPTIONS":
+        return "", 200
+    authz = request.headers.get("Authorization", "")
+    token = authz[7:].strip() if authz.startswith("Bearer ") else None
+    auth_module.revoke_session(token)
+    return jsonify({"success": True})
+
+
+def _auth_me_payload(user, sp=None):
+    """Profile + tier + today's usage for the authed user."""
+    from datetime import date
+    profile = {}
+    try:
+        if sp is None:
+            sp = auth_module.get_spotify_client_for_user(user, **_SPOTIFY_OAUTH_KWARGS)
+        me = sp.current_user()
+        profile = {
+            "id": me["id"],
+            "display_name": me.get("display_name", me["id"]),
+            "email": me.get("email"),
+            "image": me["images"][0]["url"] if me.get("images") else None,
+            "country": me.get("country"),
+            "product": me.get("product"),
+            "followers": me.get("followers", {}).get("total", 0),
+        }
+    except Exception as e:
+        print(f"[AUTH] profile fetch failed: {e}", flush=True)
+
+    today = date.today()
+    usage = ApiUsage.query.filter_by(user_id=user.id, action="migration", window_start=today).first()
+    migrations_today = usage.count if usage else 0
+    rate_limit = app.config.get("RATE_LIMIT_MIGRATIONS", 50)
+    return {
+        "spotify_user": profile,
+        "app_user": {
+            "id": user.id,
+            "email": user.email,
+            "display_name": user.display_name,
+            "avatar_url": user.avatar_url,
+            "tier": user.tier,
+            "is_active": user.is_active,
+            "created_at": user.created_at.isoformat() if user.created_at else None,
+            "usage": {
+                "migrations_today": migrations_today,
+                "migrations_limit": rate_limit,
+            },
+        },
+    }
+
+
+@app.route("/auth/me", methods=["POST", "OPTIONS"])
+def auth_me():
+    if request.method == "OPTIONS":
+        return "", 200
+    return jsonify(_auth_me_payload(g.user))
+
+
 # ==================== SPOTIFY PLAYLISTS ====================
 
 @app.route("/fetch_playlists", methods=["POST"])
@@ -220,8 +337,6 @@ def fetch_playlists():
     data = request.get_json()
     code = data.get("code")
 
-    if not code:
-        return jsonify({"error": "Authorization code required"}), 400
 
     try:
         sp, _ = get_spotify_client(code)
@@ -260,8 +375,6 @@ def playlist_tracks():
 
     if not playlist_id:
         return jsonify({"error": "playlist_id is required"}), 400
-    if not code:
-        return jsonify({"error": "Authorization code required"}), 400
 
     try:
         sp, _ = get_spotify_client(code)
@@ -306,8 +419,6 @@ def playlist_details():
     code = data.get("code")
     playlist_id = data.get("playlist_id")
 
-    if not code:
-        return jsonify({"error": "Authorization code required"}), 400
     if not playlist_id:
         return jsonify({"error": "playlist_id is required"}), 400
 
@@ -367,8 +478,6 @@ def playlist_create():
     description = data.get("description", "")
     public = bool(data.get("public", False))
 
-    if not code:
-        return jsonify({"error": "Authorization code required"}), 400
     if not name or not name.strip():
         return jsonify({"error": "name is required"}), 400
 
@@ -397,8 +506,6 @@ def playlist_add_tracks():
     track_uris = data.get("track_uris", [])
     position = data.get("position")  # optional insertion index
 
-    if not code:
-        return jsonify({"error": "Authorization code required"}), 400
     if not playlist_id:
         return jsonify({"error": "playlist_id is required"}), 400
     if not track_uris:
@@ -428,8 +535,6 @@ def playlist_remove_tracks():
     track_uris = data.get("track_uris", [])
     snapshot_id = data.get("snapshot_id")
 
-    if not code:
-        return jsonify({"error": "Authorization code required"}), 400
     if not playlist_id:
         return jsonify({"error": "playlist_id is required"}), 400
     if not track_uris:
@@ -459,8 +564,6 @@ def playlist_reorder():
     range_length = data.get("range_length", 1)
     snapshot_id = data.get("snapshot_id")
 
-    if not code:
-        return jsonify({"error": "Authorization code required"}), 400
     if not playlist_id:
         return jsonify({"error": "playlist_id is required"}), 400
     if range_start is None or insert_before is None:
@@ -488,8 +591,6 @@ def playlist_delete():
     code = data.get("code")
     playlist_id = data.get("playlist_id")
 
-    if not code:
-        return jsonify({"error": "Authorization code required"}), 400
     if not playlist_id:
         return jsonify({"error": "playlist_id is required"}), 400
 
@@ -507,6 +608,80 @@ def playlist_delete():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/playlist/genres", methods=["POST"])
+def playlist_genres():
+    """Aggregate Spotify artist genres for a playlist.
+
+    Spotify only exposes genres on the standalone /artists endpoint, not on track payloads.
+    We fetch the playlist's unique artist IDs once and batch them (50/request).
+    """
+    data = request.get_json() or {}
+    code = data.get("code")
+    playlist_id = data.get("playlist_id")
+    top_n = data.get("top_n", 30)
+
+    if not playlist_id:
+        return jsonify({"error": "playlist_id is required"}), 400
+
+    try:
+        sp, _ = get_spotify_client(code)
+
+        # Collect unique artist IDs from playlist tracks
+        artist_ids: list[str] = []
+        seen: set[str] = set()
+        offset = 0
+        limit = 100
+        while True:
+            results = sp.playlist_tracks(
+                playlist_id, offset=offset, limit=limit,
+                fields="items(track(artists(id,name))),next"
+            )
+            for item in results.get("items", []) or []:
+                track = item.get("track") or {}
+                for a in track.get("artists", []) or []:
+                    aid = a.get("id")
+                    if aid and aid not in seen:
+                        seen.add(aid)
+                        artist_ids.append(aid)
+            if results.get("next"):
+                offset += limit
+            else:
+                break
+
+        if not artist_ids:
+            return jsonify({"genres": [], "total_artists": 0})
+
+        # Batch /artists (max 50 per call)
+        from collections import Counter
+        genre_count: Counter = Counter()
+        # genre -> list of (artist_name, popularity) for sample picking
+        genre_artists: dict = {}
+        for i in range(0, len(artist_ids), 50):
+            batch = artist_ids[i:i + 50]
+            resp = sp.artists(batch) or {}
+            for artist in resp.get("artists", []) or []:
+                name = artist.get("name") or "?"
+                popularity = artist.get("popularity") or 0
+                for g in artist.get("genres", []) or []:
+                    genre_count[g] += 1
+                    genre_artists.setdefault(g, []).append((name, popularity))
+
+        genres = []
+        for genre, count in genre_count.most_common(top_n):
+            sample = sorted(genre_artists.get(genre, []), key=lambda x: x[1], reverse=True)[:3]
+            genres.append({
+                "genre": genre,
+                "count": count,
+                "sample_artists": [name for name, _ in sample],
+            })
+
+        return jsonify({"genres": genres, "total_artists": len(artist_ids)})
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/playlist/move_tracks", methods=["POST"])
 def playlist_move_tracks():
     """Move tracks across two Spotify playlists. NOT atomic — returns per-step result."""
@@ -519,8 +694,6 @@ def playlist_move_tracks():
     target_position = data.get("target_position")  # optional insertion index in target
     copy_only = bool(data.get("copy_only", False))  # if true, don't remove from source
 
-    if not code:
-        return jsonify({"error": "Authorization code required"}), 400
     if not source_playlist_id or not target_playlist_id:
         return jsonify({"error": "source and target playlist_id required"}), 400
     if source_playlist_id == target_playlist_id:
@@ -571,8 +744,6 @@ def user_profile():
     data = request.get_json()
     code = data.get("code")
 
-    if not code:
-        return jsonify({"error": "Authorization code required"}), 400
 
     try:
         sp, _ = get_spotify_client(code)
@@ -598,8 +769,6 @@ def top_tracks():
     time_range = data.get("time_range", "medium_term")  # short_term, medium_term, long_term
     limit = data.get("limit", 20)
 
-    if not code:
-        return jsonify({"error": "Authorization code required"}), 400
 
     try:
         sp, _ = get_spotify_client(code)
@@ -628,8 +797,6 @@ def top_artists():
     time_range = data.get("time_range", "medium_term")
     limit = data.get("limit", 20)
 
-    if not code:
-        return jsonify({"error": "Authorization code required"}), 400
 
     try:
         sp, _ = get_spotify_client(code)
@@ -657,8 +824,6 @@ def recently_played():
     code = data.get("code")
     limit = data.get("limit", 20)
 
-    if not code:
-        return jsonify({"error": "Authorization code required"}), 400
 
     try:
         sp, _ = get_spotify_client(code)
@@ -691,8 +856,6 @@ def liked_songs():
     limit = data.get("limit", 50)
     offset = data.get("offset", 0)
 
-    if not code:
-        return jsonify({"error": "Authorization code required"}), 400
 
     try:
         sp, _ = get_spotify_client(code)
@@ -736,8 +899,6 @@ def liked_songs_move_to_playlist():
     track_ids = data.get("track_ids", [])  # bare Spotify track IDs
     copy_only = bool(data.get("copy_only", False))
 
-    if not code:
-        return jsonify({"error": "Authorization code required"}), 400
     if not target_playlist_id:
         return jsonify({"error": "target_playlist_id is required"}), 400
     if not track_ids:
@@ -783,8 +944,6 @@ def library_stats():
     data = request.get_json()
     code = data.get("code")
 
-    if not code:
-        return jsonify({"error": "Authorization code required"}), 400
 
     try:
         sp, _ = get_spotify_client(code)
@@ -1214,8 +1373,6 @@ def migrate_tidal_to_spotify():
     playlist_id = data.get("playlist_id")
     playlist_name = data.get("playlist_name")
 
-    if not spotify_code:
-        return jsonify({"error": "Spotify authorization required"}), 400
     if not tidal_session_id or tidal_session_id not in tidal_sessions:
         return jsonify({"error": "Tidal authorization required"}), 400
     if not playlist_id:
@@ -1346,8 +1503,6 @@ def migrate_tidal_tracks():
     target_playlist_id = data.get("target_playlist_id")  # Existing Spotify playlist ID
     add_to_liked = data.get("add_to_liked", False)  # Add to Spotify liked songs
 
-    if not spotify_code:
-        return jsonify({"error": "Spotify authorization required"}), 400
     if not tidal_session_id or tidal_session_id not in tidal_sessions:
         return jsonify({"error": "Tidal authorization required"}), 400
     if not tracks:
@@ -1485,8 +1640,6 @@ def migrate_tracks():
     target_playlist_id = data.get("target_playlist_id")  # Existing playlist ID (optional)
     add_to_favorites = data.get("add_to_favorites", False)  # Add to Tidal favorites
 
-    if not spotify_code:
-        return jsonify({"error": "Spotify authorization required"}), 400
     if not tidal_session_id or tidal_session_id not in tidal_sessions:
         return jsonify({"error": "Tidal authorization required"}), 400
     if not tracks:
@@ -1602,8 +1755,6 @@ def migrate_playlist():
     playlist_id = data.get("playlist_id")
     playlist_name = data.get("playlist_name")
 
-    if not spotify_code:
-        return jsonify({"error": "Spotify authorization required"}), 400
     if not tidal_session_id or tidal_session_id not in tidal_sessions:
         return jsonify({"error": "Tidal authorization required"}), 400
     if not playlist_id:
@@ -1720,27 +1871,6 @@ def migrate_playlist():
 ARCH_REFRESH_LIMITS = {"free": 1, "plus": 4, "pro": 1000}
 
 
-def _resolve_user_from_code(code: str):
-    """Get the (User, sp_client) from a Spotify auth code. Returns (None, None) on failure."""
-    try:
-        sp, _ = get_spotify_client(code)
-        me = sp.current_user()
-        identity = UserIdentity.query.filter_by(provider="spotify", provider_user_id=me["id"]).first()
-        if not identity:
-            # Auto-register so a missing /user/me call doesn't block the feature
-            user, _ = get_or_create_user(
-                spotify_user_id=me["id"],
-                email=me.get("email"),
-                display_name=me.get("display_name", me["id"]),
-                avatar_url=me["images"][0]["url"] if me.get("images") else None,
-            )
-            return user, sp
-        return identity.user, sp
-    except Exception as e:
-        print(f"[ARCH] _resolve_user_from_code: {e}")
-        return None, None
-
-
 def _load_snapshot_for_user(user: User) -> dict:
     return decode_blob(user.archaeologist_snapshot) if user.archaeologist_snapshot else {}
 
@@ -1759,13 +1889,7 @@ def _snapshot_status_dict(user: User) -> dict:
 @app.route("/archaeologist/status", methods=["POST"])
 def archaeologist_status():
     """Return whether the user has a snapshot, when it was built, and quota remaining."""
-    data = request.get_json() or {}
-    code = data.get("code")
-    if not code:
-        return jsonify({"error": "Authorization code required"}), 400
-    user, _ = _resolve_user_from_code(code)
-    if not user:
-        return jsonify({"error": "Could not resolve user"}), 500
+    user = g.user
     limit = ARCH_REFRESH_LIMITS.get(user.tier or "free", ARCH_REFRESH_LIMITS["free"])
     _allowed, remaining = check_rate_limit(user.id, "archaeologist_refresh", daily_limit=limit)
     return jsonify({**_snapshot_status_dict(user), "refresh_remaining": remaining})
@@ -1774,14 +1898,11 @@ def archaeologist_status():
 @app.route("/archaeologist/snapshot/refresh", methods=["POST"])
 def archaeologist_refresh():
     """Build a fresh snapshot. Heavy — gated by daily per-tier quota."""
-    data = request.get_json() or {}
-    code = data.get("code")
-    if not code:
-        return jsonify({"error": "Authorization code required"}), 400
-
-    user, sp = _resolve_user_from_code(code)
-    if not user or not sp:
-        return jsonify({"error": "Could not resolve user"}), 500
+    user = g.user
+    try:
+        sp, _ = get_spotify_client()
+    except Exception as e:
+        return jsonify({"error": f"Could not get Spotify client: {e}"}), 500
 
     limit = ARCH_REFRESH_LIMITS.get(user.tier or "free", ARCH_REFRESH_LIMITS["free"])
     allowed, remaining = check_rate_limit(user.id, "archaeologist_refresh", daily_limit=limit)
@@ -1822,14 +1943,9 @@ def archaeologist_refresh():
         return jsonify({"error": str(e)}), 500
 
 
-def _ensure_snapshot(code: str):
-    """Helper for read endpoints: return (snapshot_dict, error_response_tuple)."""
-    if not code:
-        return None, (jsonify({"error": "Authorization code required"}), 400)
-    user, _ = _resolve_user_from_code(code)
-    if not user:
-        return None, (jsonify({"error": "Could not resolve user"}), 500)
-    snap = _load_snapshot_for_user(user)
+def _ensure_snapshot():
+    """Helper for read endpoints: return (snapshot_dict, error_response_tuple) for g.user."""
+    snap = _load_snapshot_for_user(g.user)
     if not snap:
         return None, (jsonify({"error": "No snapshot yet — call /archaeologist/snapshot/refresh first"}), 404)
     return snap, None
@@ -1838,7 +1954,7 @@ def _ensure_snapshot(code: str):
 @app.route("/archaeologist/overview", methods=["POST"])
 def archaeologist_overview():
     data = request.get_json() or {}
-    snap, err = _ensure_snapshot(data.get("code"))
+    snap, err = _ensure_snapshot()
     if err:
         return err
     return jsonify(arch_analytics.collection_overview(snap))
@@ -1847,7 +1963,7 @@ def archaeologist_overview():
 @app.route("/archaeologist/playlist_overlap", methods=["POST"])
 def archaeologist_playlist_overlap():
     data = request.get_json() or {}
-    snap, err = _ensure_snapshot(data.get("code"))
+    snap, err = _ensure_snapshot()
     if err:
         return err
     return jsonify(arch_analytics.playlist_overlap(snap, top_n=data.get("top_n", 20)))
@@ -1856,7 +1972,7 @@ def archaeologist_playlist_overlap():
 @app.route("/archaeologist/artist_dominance", methods=["POST"])
 def archaeologist_artist_dominance():
     data = request.get_json() or {}
-    snap, err = _ensure_snapshot(data.get("code"))
+    snap, err = _ensure_snapshot()
     if err:
         return err
     return jsonify(arch_analytics.artist_dominance(snap, top_n=data.get("top_n", 50)))
@@ -1865,7 +1981,7 @@ def archaeologist_artist_dominance():
 @app.route("/archaeologist/forgotten", methods=["POST"])
 def archaeologist_forgotten():
     data = request.get_json() or {}
-    snap, err = _ensure_snapshot(data.get("code"))
+    snap, err = _ensure_snapshot()
     if err:
         return err
     return jsonify(arch_analytics.forgotten_songs(
@@ -1878,7 +1994,7 @@ def archaeologist_forgotten():
 @app.route("/archaeologist/playlist_health", methods=["POST"])
 def archaeologist_playlist_health():
     data = request.get_json() or {}
-    snap, err = _ensure_snapshot(data.get("code"))
+    snap, err = _ensure_snapshot()
     if err:
         return err
     return jsonify(arch_analytics.playlist_health(snap))
@@ -1887,7 +2003,7 @@ def archaeologist_playlist_health():
 @app.route("/archaeologist/evolution", methods=["POST"])
 def archaeologist_evolution():
     data = request.get_json() or {}
-    snap, err = _ensure_snapshot(data.get("code"))
+    snap, err = _ensure_snapshot()
     if err:
         return err
     return jsonify(arch_analytics.listening_evolution(snap))
@@ -1898,7 +2014,7 @@ def archaeologist_evolution():
 @app.route("/archaeologist/genre_clusters", methods=["POST"])
 def archaeologist_genre_clusters():
     data = request.get_json() or {}
-    snap, err = _ensure_snapshot(data.get("code"))
+    snap, err = _ensure_snapshot()
     if err:
         return err
     return jsonify(arch_discovery.genre_clusters(
@@ -1911,7 +2027,7 @@ def archaeologist_genre_clusters():
 @app.route("/archaeologist/genre_outliers", methods=["POST"])
 def archaeologist_genre_outliers():
     data = request.get_json() or {}
-    snap, err = _ensure_snapshot(data.get("code"))
+    snap, err = _ensure_snapshot()
     if err:
         return err
     return jsonify(arch_discovery.genre_outliers(snap, top_n=data.get("top_n", 30)))
@@ -1920,7 +2036,7 @@ def archaeologist_genre_outliers():
 @app.route("/archaeologist/hidden_gems", methods=["POST"])
 def archaeologist_hidden_gems():
     data = request.get_json() or {}
-    snap, err = _ensure_snapshot(data.get("code"))
+    snap, err = _ensure_snapshot()
     if err:
         return err
     return jsonify(arch_discovery.hidden_gems(snap, top_n=data.get("top_n", 50)))
@@ -1929,7 +2045,7 @@ def archaeologist_hidden_gems():
 @app.route("/archaeologist/co_occurrence", methods=["POST"])
 def archaeologist_co_occurrence():
     data = request.get_json() or {}
-    snap, err = _ensure_snapshot(data.get("code"))
+    snap, err = _ensure_snapshot()
     if err:
         return err
     return jsonify(arch_discovery.artist_co_occurrence(
@@ -1952,6 +2068,11 @@ with app.app_context():
     _column_adds = [
         ("users", "archaeologist_snapshot", "TEXT"),
         ("users", "archaeologist_snapshot_built_at", "TIMESTAMP"),
+        # Session-auth refactor: OAuth token storage on identities.
+        ("user_identities", "access_token", "TEXT"),
+        ("user_identities", "refresh_token", "TEXT"),
+        ("user_identities", "token_expires_at", "TIMESTAMP"),
+        ("user_identities", "token_scope", "TEXT"),
     ]
     for table, col, coltype in _column_adds:
         try:

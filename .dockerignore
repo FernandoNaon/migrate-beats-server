@@ -1,0 +1,25 @@
+# Never ship sensitive or stale runtime state into the image.
+# These would otherwise be copied by `COPY . .` in the Dockerfile.
+
+# Spotipy auth-token cache — SECURITY: leaking this lets the user whose token is in
+# the file impersonate themselves to anyone else who hits the API container.
+.cache
+.cache-*
+
+# Local Tidal sessions, env file, venv, IDE & pyc junk
+.tidal-sessions/
+.env
+.env.bak
+.env-example
+.env.example
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.idea/
+.vscode/
+.DS_Store
+
+# Git history
+.git/
+.gitignore

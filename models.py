@@ -55,7 +55,11 @@ class User(db.Model):
 
 
 class UserIdentity(db.Model):
-    """Links users to external providers (Spotify, Tidal)."""
+    """Links users to external providers (Spotify, Tidal) and stores their OAuth tokens.
+
+    SECURITY: access_token is short-lived (1h) so stored plaintext; refresh_token is
+    long-lived and stored Fernet-encrypted (see crypto.py).
+    """
     __tablename__ = 'user_identities'
 
     id = db.Column(db.String(36), primary_key=True, default=generate_uuid)
@@ -64,8 +68,33 @@ class UserIdentity(db.Model):
     provider_user_id = db.Column(db.String(255), nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
+    # OAuth token storage (added for session-based auth refactor)
+    access_token = db.Column(db.Text, nullable=True)            # short-lived; plaintext OK
+    refresh_token = db.Column(db.Text, nullable=True)           # long-lived; Fernet-encrypted
+    token_expires_at = db.Column(db.DateTime, nullable=True)    # when access_token expires
+    token_scope = db.Column(db.Text, nullable=True)             # granted scope string
+
     __table_args__ = (
         db.UniqueConstraint('provider', 'provider_user_id', name='uix_provider_user'),
+    )
+
+
+class Session(db.Model):
+    """Opaque server-side session. The client holds the raw token; we store only its hash.
+
+    SECURITY: this replaces sending the Spotify OAuth code as a de-facto password on every
+    request. The raw token never touches the DB — a DB leak can't resurrect live sessions.
+    """
+    __tablename__ = 'sessions'
+
+    token_hash = db.Column(db.String(64), primary_key=True)  # sha256 hex of the raw token
+    user_id = db.Column(db.String(36), db.ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    last_used_at = db.Column(db.DateTime, default=datetime.utcnow)
+    expires_at = db.Column(db.DateTime, nullable=False)
+
+    __table_args__ = (
+        db.Index('idx_session_user', 'user_id'),
     )
 
 

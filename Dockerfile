@@ -1,6 +1,10 @@
 # Dockerfile for Migrate Beats Server
 FROM python:3.11-slim
 
+# Flush print/log output immediately — without this, gunicorn workers buffer stdout
+# inside the container and we lose tracebacks until the worker exits.
+ENV PYTHONUNBUFFERED=1
+
 # Set working directory
 WORKDIR /app
 
